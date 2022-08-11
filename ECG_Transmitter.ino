@@ -1,8 +1,19 @@
 #include <Arduino.h>
-#include <U8g2lib.h>
 #include <Wire.h>
 
-//#define SCROLL_VIEW
+
+#define SIG_IN 26    // 信号入力ピン
+#define ADC_COMPE 14 // ADCエラッタパッチ選択（LOWなら補正無し）
+
+//液晶関連
+const uint8_t ADDRES_OLED = 0x3C;
+const int SDA_OLED = 5;
+const int SCL_OLED = 4;
+const uint32_t Frequensy_OLED = 400000; // Max=400kHz
+
+uint8_t oled_ram_buf[128][8] = {0};
+//液晶関連ここまで
+
 
 #define BOARD_LED 25 // 基板内蔵LED
 #define CHECK_PIN 16 // 動作タイミングチェックピン
@@ -18,8 +29,6 @@
 #define LCD_BUF_SIZE 128 // LCDの描画バッファ
 #define DATA_BUF_SIZE  128// ADCで取得した生波形のバッファサイズ
 
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);;  // 0.96inch OLED SSD1306 使用時に選択
-//U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE); // 1.3inch OLED SH1106 使用時に選択
 
 //グローバル変数
 uint16_t range = 8; // レンジ番号(3:100Hz, 4:200Hz, 5:50Hz, 6:1k, 7:2k, 8:5k, 9:10k, 10:20k, 11:50k)
@@ -29,18 +38,6 @@ uint8_t latest_buf_no = 0;
 uint8_t last_data = 0;
 uint8_t wave[129];
 
-void readWave()
-{
-    if (buf_no > DATA_BUF_SIZE)
-    {
-        buf_no=0;
-    }
-    latest_buf_no = buf_no;
-    last_data = wave[buf_no];          // LCDスクロール表示の前データ塗りつぶし用データ
-    wave[buf_no] = analogRead(SIG_IN); // 波形データー取得
-    buf_no++;
-    // delayMicroseconds(3886);      // サンプリング周期調整
-}
 
 void setup()
 {
@@ -51,215 +48,235 @@ void setup()
     pinMode(DN_SW, INPUT_PULLUP);     // Downボタン
     pinMode(ADC_COMPE, INPUT_PULLUP); // ADC補正指定ピン（HIGHで補正有り）
 
-    Serial.begin(115200);     // Rp pico はシリアルの起動が失敗することがある
-    analogReadResolution(8); // ADCのフルスケールを8ビットに設定
 
-    u8g2.begin(); // (I2Cバス400kbpsで開始される)
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.setDrawColor(1);
-    u8g2.setFontPosTop(); // 左上を文字位置とする
-    u8g2.clearBuffer();
-    //u8g2.drawStr(0, 0, "Multi Range FFT v0.4");
 
-    u8g2.sendBuffer();
+    // ADC初期化古いやつ。FIFOにするときに消すコード
+    pinMode(ADC_COMPE, INPUT_PULLUP); // ADC補正指定ピン（HIGHで補正有り）
+    analogReadResolution(12);         // ADCのフルスケールを8ビットに設定
+
+    // ADCの初期化ここに必要★★★★
+
+    Serial1.begin(115200);
+
+    SSD1306_Init(); // OLED ssd1306 初期化
     delay(1000);
+    Clear_Display_All();
+
 }
 
 void loop()
 {
-    uint8_t data=0;
 
-    // 波形の読み取り
-    digitalWrite(BOARD_LED, LOW); // ボード内蔵LED点灯
-    digitalWrite(CHECK_PIN, LOW); // タイミング測定ピンHigh
+    int i;
+    static uint8_t last_segment_no = 0;
+    static uint8_t last_data = 0;
+    uint8_t new_data = 0;
+    static uint16_t count360 = 0;
+    static uint8_t countupno = 1;
 
-#if defined(SCROLL_VIEW)
-    readWave(); // 波形を読み取り
+    int adcdata = analogRead(SIG_IN);
+    new_data = round(adcdata) - 1768;
+    // new_data =255;
+    Serial1.println(new_data);
+    if (new_data > 63)
+        new_data = 10;
 
-#else
-    data = analogRead(SIG_IN)-100; // 波形データー取得
+    //★★★★これを外すと描画でエラーになるぞ！謎！★★★★★
+    if (new_data == 0)
+        new_data = 1;
 
-#endif
-    digitalWrite(CHECK_PIN, HIGH); // タイミング測定ピンLow
-    digitalWrite(BOARD_LED, HIGH); // ボード内蔵LED消灯
-
-    showWaveform(data);
-    //showBackGround(); // 目盛線等の背景を表示           (1.4ms)
-    u8g2.sendBuffer();
-
-    //delay(5);
+    koushin(last_data, new_data, last_segment_no);
+    last_data = new_data;
+    if (last_segment_no < 127)
+    {
+        last_segment_no++;
+    }
+    else
+    {
+        last_segment_no = 0;
+    }
 }
 
-void showWaveform(uint8_t new_y)
+//******************************************
+void SSD1306_Init()
 {
-    static uint8_t last_x_axis=0;
-    static uint8_t last_y = 0;
-    static uint8_t new_x_axis;
+    i2c_init(i2c0, 100 * 3 * 80); // EARLEPHILHOWER_PICOのライブラリは、 Wire.setClockでclockが変えられない(1.9.4)ため、sdkの方法でclockを変える必要がある
 
-    if (last_x_axis > 126)
+    Wire.begin();
+    // Wire.begin(SDA_OLED, SCL_OLED); もとのソースにあったコード
+    // Wire.setSDA(4);おっちゃんのデフォルトは4,5なので、これ書く必要なし。標準のRP2040の場合i2c1なのでここじゃないので注意
+    // Wire.setSCL(5);
+    Wire.setClock(Frequensy_OLED);
+    delay(100);
+
+    Wire.beginTransmission(ADDRES_OLED);
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command) follow Max=31byte
+    Wire.write(0xAE);       // display off
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command) follow Max=31byte
+    Wire.write(0xA8);       // Set Multiplex Ratio  0xA8, 0x3F
+    Wire.write(0b00111111); // 64MUX
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0xD3);       // Set Display Offset 0xD3, 0x00
+    Wire.write(0x00);
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command)
+    Wire.write(0x40);       // Set Display Start Line 0x40
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command)
+    Wire.write(0xA1);       // Set Segment re-map 0xA0/0xA1
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command)
+    Wire.write(0xC0);       // Set COM Output Scan Direction 0xC0,/0xC8
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0xDA);       // Set COM Pins hardware configuration 0xDA, 0x02
+    Wire.write(0b00010010);
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0x81);       // Set Contrast Control 0x81, default=0x7F
+    Wire.write(255);        // 0-255
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command)
+    Wire.write(0xA4);       // Disable Entire Display On
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command)
+    Wire.write(0xA6);       // Set Normal Display 0xA6, Inverse display 0xA7
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0xD5);       // Set Display Clock Divide Ratio/Oscillator Frequency 0xD5, 0x80
+    Wire.write(0b10000000);
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0x20);       // Set Memory Addressing Mode
+    Wire.write(0x10);       // Page addressing mode
+    Wire.endTransmission();
+    Wire.beginTransmission(ADDRES_OLED);
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0x22);       // Set Page Address
+    Wire.write(0);          // Start page set
+    Wire.write(7);          // End page set
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0x21);       // set Column Address
+    Wire.write(0);          // Column Start Address
+    Wire.write(127);        // Column Stop Address
+    Wire.write(0b00000000); // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0x8D);       // Set Enable charge pump regulator 0x8D, 0x14
+    Wire.write(0x14);
+    Wire.write(0b10000000); // control byte, Co bit = 1 (1byte only), D/C# = 0 (command)
+    Wire.write(0xAF);       // Display On 0xAF
+    Wire.endTransmission();
+}
+//**************************************************
+void Clear_Display_All()
+{
+    uint8_t i, j, k;
+
+    for (i = 0; i < 8; i++)
+    { // Page(0-7)
+        Column_Page_Set(0, 127, i);
+
+        for (j = 0; j < 16; j++)
+        { // column = 8byte x 16
+            Wire.beginTransmission(ADDRES_OLED);
+            Wire.write(0b01000000); // control byte, Co bit = 0 (continue), D/C# = 1 (data)
+            for (k = 0; k < 8; k++)
+            { // continue to 31byte
+                Wire.write(0x00);
+            }
+            Wire.endTransmission();
+        }
+        // delay(1);
+    }
+
+    for (i = 0; i < 128; i++)
     {
-        new_x_axis = 0;
-        //消去処理
-        u8g2.clearDisplay();
-            //描画処理
-            u8g2.drawLine(new_x_axis, last_y, new_x_axis, new_y); // 波形プロット
+        for (j = 0; j < 8; j++)
+        {
+            oled_ram_buf[i][j] = 0;
+        }
     }
-    else{
-        new_x_axis = last_x_axis + 1;
-        u8g2.drawLine(last_x_axis, last_y, new_x_axis, new_y); // 波形プロット
-    }
-
-    last_x_axis = new_x_axis;
-    last_y = new_y;
+}
+//**************************************************
+//******************************************
+void Column_Page_Set(uint8_t x0, uint8_t x1, uint8_t page)
+{
+    Wire.beginTransmission(ADDRES_OLED);
+    Wire.write(0b10000000);  // control byte, Co bit = 1 (1byte only), D/C# = 0 (command) Max=31byte
+    Wire.write(0xB0 | page); // set page start address(B0～B7)
+    Wire.write(0b00000000);  // control byte, Co bit = 0 (continue), D/C# = 0 (command)
+    Wire.write(0x21);        // set Column Address
+    Wire.write(x0);          // Column Start Address(0-127)
+    Wire.write(x1);          // Column Stop Address(0-127)
+    Wire.endTransmission();
 }
 
-void showWaveform_SCROLL_VIEW()
-{ // 入力波形を表示
-    int last_y, new_y;
-    u8g2.setDrawColor(0); // 黒で書く
-    uint16_t last_baf_no=0;
+void koushin(uint8_t y1, uint8_t y2, uint8_t last_segment_no)
+{
+    // uint8_t oled_ram_buf[2][8] = 0;
+    uint8_t page_no_temp = 0; // 0 to 7の８ページある
+    uint8_t latest_segment_no = 0;
+    uint8_t page, ytemp;
 
-
-
-
-
-        last_y = last_data / 64;
-        uint16_t byouga_no;
-        byouga_no = latest_buf_no;
-        for (int i = 0; i < 128; i += 1) //前回のを黒で塗りつぶす
-        {
-
-            new_y = (wave[byouga_no] / 64);
-            //★たぶんここ描画位置X座標がずれる
-            u8g2.drawLine(PX2 + i, last_y, PX2 + i + 1, new_y); // 波形プロット
-            last_y = new_y;
-            byouga_no++;
-    }
-
-
-    last_y = (wave[0]) / 64;
-    u8g2.setDrawColor(1); // 白で書く
-    byouga_no = last_baf_no;
-    byouga_no = last_baf_no+2;
-    for (int i = 2; i < 254; i += 2)
+    //描画するsegment_noを決める
+    //ただし、最後のセグメントは描画しないので
+    if (last_segment_no < 127)
     {
-        byouga_no += 2;
-        if (byouga_no > 250)
-        {
-            byouga_no = 0;
-        }
-
-        new_y = PY1 - (wave[i + 2] / 64);
-        //★たぶんここ描画位置X座標がずれる
-        u8g2.drawLine(PX2 + i / 2, last_y, PX2 + i / 2 + 1, new_y); // 波形プロット
-        last_y = new_y;
+        latest_segment_no = last_segment_no + 1;
     }
-}
-
-void showBackGround()
-{ // グラフの修飾（目盛他の作画）
-    //　領域区分線
-    u8g2.setDrawColor(1);          // 白で書く
-    u8g2.drawVLine(0, 6, 6);       // 時間軸左端 縦線
-    u8g2.drawVLine(63, 6, 6);      // 時間軸1/2
-    u8g2.drawVLine(127, 6, 6);     // 時間軸右端
-    u8g2.drawVLine(1, 8, 2);       // 時間軸左端 中心線
-    u8g2.drawVLine(63 - 1, 8, 2);  // 時間軸1/2
-    u8g2.drawVLine(63 + 1, 8, 2);  // 時間軸1/2
-    u8g2.drawVLine(127 - 1, 8, 2); // 時間軸右端
-    u8g2.drawHLine(PX2, PY2, 128); // スペクトル下端線
-
-    // 周波数目盛（下の横軸）
-    for (int xp = PX2; xp < 127; xp += 10)
-    { // 等間隔目盛
-        u8g2.drawVLine(xp, PY2 + 1, 2);
+    else
+    {
+        latest_segment_no = 0;
     }
-    u8g2.drawBox(PX2, PY2 + 2, 2, 2);      // 0k太い目盛(2画素）
-    u8g2.drawBox(PX2 + 49, PY2 + 2, 3, 2); // 10k太い目盛(3画素）
-    u8g2.drawBox(PX2 + 99, PY2 + 2, 3, 2); // 20k太い目盛
 
-    freqScale(); // レンジに対応した周波数目盛を表示
+    //
+    if (y1 > 63)
+        y1 = 63;
+    if (y2 > 63)
+        y2 = 63;
 
-    //　スペクトルレベル目盛（縦軸）
-    u8g2.setDrawColor(2); // 重なっても見えるようにXORで書く
-    for (int y = PY2 - 10; y > 16; y -= 10)
-    {                            // dB目盛線（横の点線）
-        u8g2.drawHLine(0, y, 2); // ゼロの傍の目盛
-        for (int x = 9; x < 127; x += 10)
+    for (page = 0; page < 8; page++)
+    {
+        oled_ram_buf[latest_segment_no][page] = 0x00; //一週前のデータは消しておく
+    }
+
+    //描画する点と点の間に線を引く
+    if (y1 > y2)
+    {
+        //右下がりデータならー方向にカウントする
+        for (ytemp = y1; ytemp >= y2; ytemp--)
         {
-            u8g2.drawHLine(x, y, 3);
+            page = floor(ytemp / 8);
+            uint8_t sakaime = y1 - ((y1 - y2) >> 1);
+            if (ytemp >= sakaime)
+            {
+                oled_ram_buf[last_segment_no][page] = oled_ram_buf[last_segment_no][page] | (0x01 << (ytemp % 8));
+            }
+            else
+            {
+                oled_ram_buf[latest_segment_no][page] = oled_ram_buf[latest_segment_no][page] | (0x01 << (ytemp % 8));
+            }
         }
     }
-
-    for (int y = PY2 - 10; y > 16; y -= 10)
-    { // (-60dB対応）交点マーク（+）の縦の線
-        for (int x = 0; x < 110; x += 50)
+    else
+    {
+        //右上がりデータなら＋方向にカウントする
+        for (ytemp = y1; ytemp <= y2; ytemp++)
         {
-            u8g2.drawPixel(x, y - 1); // 縦線では交点が消えるので点で描く
-            u8g2.drawPixel(x, y + 1);
+            page = floor(ytemp / 8);
+            uint8_t sakaime = y1 + ((y2 - y1) >> 1);
+            if (ytemp < sakaime)
+            {
+                oled_ram_buf[last_segment_no][page] = oled_ram_buf[last_segment_no][page] | (0x01 << (ytemp % 8));
+            }
+            else
+            {
+                oled_ram_buf[latest_segment_no][page] = oled_ram_buf[latest_segment_no][page] | (0x01 << (ytemp % 8));
+            }
         }
     }
-    u8g2.setFont(u8g2_font_micro_tr); // 小さな3x5ドットフォントで、
-    u8g2.setFontMode(0);
-    u8g2.setDrawColor(1);
-    u8g2.drawStr(117, 16, "0dB"); // スペクトル感度
-    u8g2.drawStr(117, 26, "-20");
-    u8g2.drawStr(117, 36, "-40");
-    u8g2.drawStr(117, 45, "-60");
-}
 
-void freqScale()
-{                                          // 周波数目盛表示
-    u8g2.setFont(u8g2_font_mozart_nbp_tr); // 5x7ドットフォント
-    u8g2.drawStr(0, 56, "0");              // 原点の0を表示
-    switch (range)
-    { // レンジ番号に応じた周波数を表示
-    case 3:
-        u8g2.drawStr(114, 0, "1s");  // サンプリング期間
-        u8g2.drawStr(45, 56, "50");  // 1/2周波数
-        u8g2.drawStr(92, 56, "100"); // フルスケール周波数
-        break;
-    case 4:
-        u8g2.drawStr(102, 0, "0.5s");
-        u8g2.drawStr(42, 56, "100");
-        u8g2.drawStr(92, 56, "200");
-        break;
-    case 5:
-        u8g2.drawStr(96, 0, "200ms");
-        u8g2.drawStr(42, 56, "250");
-        u8g2.drawStr(92, 56, "500");
-        break;
-    case 6:
-        u8g2.drawStr(96, 0, "100ms");
-        u8g2.drawStr(42, 56, "500");
-        u8g2.drawStr(95, 56, "1k");
-        break;
-    case 7:
-        u8g2.drawStr(102, 0, "50ms");
-        u8g2.drawStr(45, 56, "1k");
-        u8g2.drawStr(95, 56, "2k");
-        break;
-    case 8:
-        u8g2.drawStr(102, 0, "20ms");
-        u8g2.drawStr(41, 56, "2.5k");
-        u8g2.drawStr(95, 56, "5k");
-        break;
-    case 9:
-        u8g2.drawStr(102, 0, "10ms");
-        u8g2.drawStr(45, 56, "5k");
-        u8g2.drawStr(92, 56, "10k");
-        break;
-    case 10:
-        u8g2.drawStr(108, 0, "5ms");
-        u8g2.drawStr(42, 56, "10k");
-        u8g2.drawStr(92, 56, "20k");
-        break;
-    case 11:
-        u8g2.drawStr(108, 0, "2ms");
-        u8g2.drawStr(42, 56, "25k");
-        u8g2.drawStr(92, 56, "50k");
-        break;
-    default:
-        break;
+    for (page = 0; page < 8; page++)
+    {
+        Column_Page_Set(last_segment_no, last_segment_no + 1, page); //セグメント128にも書いちゃってるけど、そこが問題あったら対策必要です。
+        Wire.beginTransmission(ADDRES_OLED);
+        // 2セグメントずつ送信することで高速化する。
+        Wire.write(0b01000000); // control byte, Co bit = 0 (continue), D/C# = 1 (data)
+        Wire.write(oled_ram_buf[last_segment_no][page]);
+        Wire.write(oled_ram_buf[latest_segment_no][page]);
+        Wire.endTransmission();
     }
+
+    //最後に、次の描画segmentを更新しておく
+    // last_segment_no = latest_segment_no;
 }

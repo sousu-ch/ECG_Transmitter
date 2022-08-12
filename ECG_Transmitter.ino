@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-
+#include "hardware/adc.h"
 
 #define SIG_IN 26    // 信号入力ピン
 #define ADC_COMPE 14 // ADCエラッタパッチ選択（LOWなら補正無し）
@@ -46,22 +46,35 @@ void setup()
     pinMode(OF_LED, OUTPUT);          // オーバーフロー表示LED
     pinMode(UP_SW, INPUT_PULLUP);     // UPボタン
     pinMode(DN_SW, INPUT_PULLUP);     // Downボタン
-    pinMode(ADC_COMPE, INPUT_PULLUP); // ADC補正指定ピン（HIGHで補正有り）
-
-
-
-    // ADC初期化古いやつ。FIFOにするときに消すコード
-    pinMode(ADC_COMPE, INPUT_PULLUP); // ADC補正指定ピン（HIGHで補正有り）
-    analogReadResolution(12);         // ADCのフルスケールを8ビットに設定
-
-    // ADCの初期化ここに必要★★★★
-
+    
+    //pinMode(ADC_COMPE, INPUT_PULLUP); // ADC補正指定ピン（HIGHで補正有り）
+    analogReadResolution(12); // ADCのフルスケールを8ビットに設定
     Serial1.begin(115200);
+    //ADC初期化
+    adc_gpio_init(SIG_IN);
+
+    adc_init();
+    //adc_select_input(SIG_IN);
+    adc_fifo_setup(
+        true,  // Write each comp1leted conversion to the sample FIFO
+        false,  // Enable DMA data request (DREQ)
+        0,     // DREQ (and IRQ) asserted when at least 1 sample present
+        false, // We won't see the ERR bit because of 8 bit reads; disable.
+        false   // Shift each sample to 8 bits when pushing to FIFO
+    );
+
+    // Divisor of 0 -> full speed. Free-running capture with the divider is
+    // equivalent to pressing the ADC_CS_START_ONCE button once per `div + 1`
+    // cycles (div not necessarily an integer). Each conversion takes 96
+    // cycles, so in general you want a divider of 0 (hold down the button
+    // continuously) or > 95 (take samples less frequently than 96 cycle
+    // intervals). This is all timed by the 48 MHz ADC clock.
+    adc_set_clkdiv(23436.5); // 2048サンプル毎秒
+    adc_run(true);
 
     SSD1306_Init(); // OLED ssd1306 初期化
     delay(1000);
     Clear_Display_All();
-
 }
 
 void loop()
@@ -73,30 +86,99 @@ void loop()
     uint8_t new_data = 0;
     static uint16_t count360 = 0;
     static uint8_t countupno = 1;
+    static float adcbuf[32];
+    static uint8_t adcbufcount = 0;
+    float fadcdata;
 
-    int adcdata = analogRead(SIG_IN);
-    new_data = round(adcdata) - 1768;
-    // new_data =255;
-    Serial1.println(new_data);
-    if (new_data > 63)
-        new_data = 10;
-
-    //★★★★これを外すと描画でエラーになるぞ！謎！★★★★★
-    if (new_data == 0)
-        new_data = 1;
-
-    koushin(last_data, new_data, last_segment_no);
-    last_data = new_data;
-    if (last_segment_no < 127)
+    // ADC取り込み
+    if(adc_fifo_get_level()>3)
     {
-        last_segment_no++;
+        for(uint8_t i=0;i<4;i++)
+        {
+            adcbuf[adcbufcount] = (float)adc_fifo_get();
+            adcbufcount++;
+        }
     }
-    else
+    if (adcbufcount>31)
     {
-        last_segment_no = 0;
+        adcbufcount=0;
+        //FIR処理
+        //Serial1.println(adcbuf[0]);
+
+        fadcdata = (uint16_t)fir_LPF100(&adcbuf[0]);
+
+    //    new_data = round(fadcdata) - 1768;
+        new_data = round(fadcdata)-2030;
+        // new_data =255;
+        //Serial1.println(new_data);
+        if (new_data > 63)
+            new_data = 10;
+
+        //★★★★これを外すと描画でエラーになるぞ！謎！★★★★★
+        if (new_data == 0)
+            new_data = 1;
+
+        koushin(last_data, new_data, last_segment_no);
+        last_data = new_data;
+        if (last_segment_no < 127)
+        {
+            last_segment_no++;
+        }
+        else
+        {
+            last_segment_no = 0;
+        }
     }
+
+    //int adcdata = analogRead(SIG_IN);
+
 }
 
+//******************************************
+float fir_LPF100(float *data)
+{
+    float result=0;
+    float hm[32] = {
+        0,
+        0.000184735,
+        0.001054277,
+        0.002241982,
+        0.00216018,
+        -0.001171869,
+        -0.008456167,
+        -0.017535761,
+        -0.023041651,
+        -0.017915661,
+        0.00352516,
+        0.042284167,
+        0.092829584,
+        0.143892551,
+        0.181938834,
+        0.196019276,
+        0.181938834,
+        0.143892551,
+        0.092829584,
+        0.042284167,
+        0.00352516,
+        -0.017915661,
+        -0.023041651,
+        -0.017535761,
+        -0.008456167,
+        -0.001171869,
+        0.00216018,
+        0.002241982,
+        0.001054277,
+        0.000184735,
+        0,
+        0
+    };
+    //FIRもどき。ダウンサンプリングもしちゃう。
+    for (uint8_t k = 0; k < 32; k++)
+    {
+        result += hm[k] * data[k];
+    }
+    return result;
+}
 //******************************************
 void SSD1306_Init()
 {

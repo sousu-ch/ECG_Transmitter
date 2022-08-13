@@ -48,7 +48,7 @@ void setup()
     pinMode(DN_SW, INPUT_PULLUP);     // Downボタン
     
     //pinMode(ADC_COMPE, INPUT_PULLUP); // ADC補正指定ピン（HIGHで補正有り）
-    analogReadResolution(12); // ADCのフルスケールを8ビットに設定
+    analogReadResolution(8); // ADCのフルスケールを8ビットに設定
     Serial1.begin(115200);
     //ADC初期化
     adc_gpio_init(SIG_IN);
@@ -60,7 +60,7 @@ void setup()
         false,  // Enable DMA data request (DREQ)
         0,     // DREQ (and IRQ) asserted when at least 1 sample present
         false, // We won't see the ERR bit because of 8 bit reads; disable.
-        false   // Shift each sample to 8 bits when pushing to FIFO
+        true   // Shift each sample to 8 bits when pushing to FIFO
     );
 
     // Divisor of 0 -> full speed. Free-running capture with the divider is
@@ -69,7 +69,9 @@ void setup()
     // cycles, so in general you want a divider of 0 (hold down the button
     // continuously) or > 95 (take samples less frequently than 96 cycle
     // intervals). This is all timed by the 48 MHz ADC clock.
-    adc_set_clkdiv(23436.5); // 2048サンプル毎秒
+    //adc_set_clkdiv(23436.5); // 2048サンプル毎秒
+    //adc_set_clkdiv(46874); // 1024サンプル毎秒
+    adc_set_clkdiv(29999); // 1600サンプル毎秒 商用電源の50Hzの整数倍を選定している
     adc_run(true);
 
     SSD1306_Init(); // OLED ssd1306 初期化
@@ -86,29 +88,36 @@ void loop()
     uint8_t new_data = 0;
     static uint16_t count360 = 0;
     static uint8_t countupno = 1;
-    static float adcbuf[32];
+    static float adcbuf[64];
     static uint8_t adcbufcount = 0;
+    static uint8_t adc_16_cycle_count = 0;
     float fadcdata;
 
     // ADC取り込み
-    if(adc_fifo_get_level()>3)
+    if(adc_fifo_get_level()>0)
     {
-        for(uint8_t i=0;i<4;i++)
+        adcbuf[adcbufcount] = (float)adc_fifo_get();
+        adcbufcount++;
+        if (adcbufcount > 63)
         {
-            adcbuf[adcbufcount] = (float)adc_fifo_get();
-            adcbufcount++;
+            adcbufcount = 0;
         }
+        adc_16_cycle_count++;
     }
-    if (adcbufcount>31)
+    // 1600Hzサンプリング32カウントだから
+    // 1600/32=50Hz周期で描画する。
+    // 1フレーム128lineなので、(1/50)*128=2.5[sec]で１ページ描画する
+    if (adc_16_cycle_count > 31)
     {
-        adcbufcount=0;
+        adc_16_cycle_count = 0;
         //FIR処理
         //Serial1.println(adcbuf[0]);
 
-        fadcdata = (uint16_t)fir_LPF100(&adcbuf[0]);
+        //★★★★★★ここ、floatの値がマイナスになった時の処理が抜けてる★★★★★★
+        fadcdata = (uint16_t)fir_LPF100(&adcbuf[0], adcbufcount);
 
-    //    new_data = round(fadcdata) - 1768;
-        new_data = round(fadcdata)-2030;
+        //    new_data = round(fadcdata) - 1768;
+        new_data = round(fadcdata)-96;
         // new_data =255;
         //Serial1.println(new_data);
         if (new_data > 63)
@@ -135,47 +144,151 @@ void loop()
 }
 
 //******************************************
-float fir_LPF100(float *data)
+float fir_LPF100(float *data, uint8_t count)
 {
     float result=0;
-    float hm[32] = {
-        0,
-        0.000184735,
-        0.001054277,
-        0.002241982,
-        0.00216018,
-        -0.001171869,
-        -0.008456167,
-        -0.017535761,
-        -0.023041651,
-        -0.017915661,
-        0.00352516,
-        0.042284167,
-        0.092829584,
-        0.143892551,
-        0.181938834,
-        0.196019276,
-        0.181938834,
-        0.143892551,
-        0.092829584,
-        0.042284167,
-        0.00352516,
-        -0.017915661,
-        -0.023041651,
-        -0.017535761,
-        -0.008456167,
-        -0.001171869,
-        0.00216018,
-        0.002241982,
-        0.001054277,
-        0.000184735,
-        0,
+    const float hm[64] = {
+        0.004108952,
+        0.001844843,
+        -0.000663094,
+        -0.003318615,
+        -0.006012725,
+        -0.008627203,
+        -0.011038618,
+        -0.013122699,
+        -0.014758884,
+        -0.015834915,
+        -0.016251266,
+        -0.015925276,
+        -0.014794797,
+        -0.012821218,
+        -0.009991748,
+        -0.006320846,
+        -0.001850727,
+        0.003349083,
+        0.009183158,
+        0.015532513,
+        0.022257799,
+        0.029203276,
+        0.036201406,
+        0.043077939,
+        0.049657298,
+        0.055768095,
+        0.06124858,
+        0.065951822,
+        0.069750464,
+        0.072540854,
+        0.074246433,
+        0.074820235,
+        0.074246433,
+        0.072540854,
+        0.069750464,
+        0.065951822,
+        0.06124858,
+        0.055768095,
+        0.049657298,
+        0.043077939,
+        0.036201406,
+        0.029203276,
+        0.022257799,
+        0.015532513,
+        0.009183158,
+        0.003349083,
+        -0.001850727,
+        -0.006320846,
+        -0.009991748,
+        -0.012821218,
+        -0.014794797,
+        -0.015925276,
+        -0.016251266,
+        -0.015834915,
+        -0.014758884,
+        -0.013122699,
+        -0.011038618,
+        -0.008627203,
+        -0.006012725,
+        -0.003318615,
+        -0.000663094,
+        0.001844843,
+        0.004108952,
         0
     };
+
+    const float hm50Hz[64] = {
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625};
+
     //FIRもどき。ダウンサンプリングもしちゃう。
-    for (uint8_t k = 0; k < 32; k++)
+    for (uint8_t k = 0; k < 64; k++)
     {
-        result += hm[k] * data[k];
+        result += hm[k] * data[count];
+        count++;
+        if(count>63)
+        {
+            count = 0;
+        }
     }
     return result;
 }

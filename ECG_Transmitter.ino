@@ -5,19 +5,24 @@
 #define SIG_IN 26               // 信号入力ピン
 #define SEL_SW 28               // レンジセレクトスイッチ
 #define HEART_BEAT_AVERAGE_NO 4 // 心拍計算のためにに何周期移動平均するか
-#define OLED_OFFSET 49          // OLEDの中心に対して波形中心をどれだけオフセットするか。
+#define OLED_OFFSET 110          // OLEDの中心に対して波形中心をどれだけオフセットするか。
+//#define DEBUG_PRINT
+#define ADC_SAMPLING_RATE 1600 // 50Hz用。1600Hzサンプリングの64T(=FIRタップ長)は50Hzの2周期に相当する
+//#define ADC_SAMPLING_RATE 1920 // 60Hz用
+
 //グローバル変数
 
 // OLED関連
 const uint8_t ADDRES_OLED = 0x3C;
 const int SDA_OLED = 5;
 const int SCL_OLED = 4;
-const uint32_t Frequensy_OLED = 400000; // Max=400kHz。実は、さらに数倍の実力があるようだ。
-
-uint8_t oled_ram_buf[128][8] = {0};
-uint8_t dig_oled_buf[18];
-uint8_t heart_beat_draw_EN =0;
+const uint32_t Frequensy_OLED = 3000000; // Max=400kHz。実は、さらに数倍の実力があるようだ。オーバークロックで3Mに設定した。
 // OLED関連ここまで
+
+uint8_t oled_ram_buf[128][8] = {0}; //OLEDの表示データ用バッファ。よこ128segment,たて8page
+uint8_t dig_oled_buf[18];           //現在の心拍数を記憶しておくバッファ。ECGで表示が上書きされるのの防止のため。
+uint8_t heart_beat_draw_EN =0;      //心拍を検出したことを示すフラグ。このフラグがたったら画面上部に心拍検出マークを付ける
+static uint8_t draw_cycle = 1;      // OLED描画周期。draw_buf_cycle_countに対して、draw_cycle周期でOLEDにデータを送信する。
 
 void setup()
 {
@@ -48,7 +53,10 @@ void setup()
     // intervals). This is all timed by the 48 MHz ADC clock.
     //adc_set_clkdiv(23436.5); // 2048サンプル毎秒
     //adc_set_clkdiv(46874); // 1024サンプル毎秒
-    adc_set_clkdiv(29999); // 1600サンプル毎秒 商用電源の50Hzの整数倍を選定している
+
+    // 商用電源のの整数倍を選定している。29999は1600Hzサンプリングで、64T(=FIRタップ長)は50Hzの2周期に相当する
+    adc_set_clkdiv(48000000 / ADC_SAMPLING_RATE - 1); 
+
     adc_run(true);
 
     SSD1306_Init(); // OLED ssd1306 初期化
@@ -67,7 +75,7 @@ void loop()
     static float adcbuf[64];
     static float buf3[3];
     static uint8_t adcbufcount = 0;
-    static uint8_t adc_cycle_count = 0;
+    static uint8_t draw_buf_cycle_count = 0;
     static uint8_t sw_count = 0;
     float fadcdata;
     float ddadc;
@@ -86,30 +94,32 @@ void loop()
 
     static uint8_t sw_stat = 0;
     static uint8_t sw_HL = 0;
-    static uint8_t adcadc_cycle = 15;
+    static uint8_t draw_buf_cycle = 8;
     static uint8_t sw_timer_count = 0;
     static uint8_t view_stage = 0;
 
-    static uint8_t draw_cycle = 0;
     static uint8_t draw_cycle_count = 0;
-
+    static uint8_t adcbufcount_temp = 0;
     // ADC取り込み。計算および描画処理直後はFIFOに蓄積され、最大8byteまでたまることがある。
     // FIFOサイズは最大4だが、ADC分解能を8bit設定にすることで8byteに拡張している。
     if (adc_fifo_get_level() > 0)
     {
         adcbuf[adcbufcount] = (float)adc_fifo_get();
+        adcbufcount_temp=adcbufcount;
         adcbufcount++;
         //FIRフィルタが64段なので、バッファも64個のリングバッファにしてある
         if (adcbufcount > 63)
         {
             adcbufcount = 0;
         }
-        adc_cycle_count++;
+        draw_buf_cycle_count++;
         sw_timer_count++;
         ddadc_count++;
         max_count++;
     }
-    //16カウントごと(1600HzなのでT=10ms)にポートを読んで、LOWならON継続回数をカウントアップする。
+
+    //スイッチ入力の監視
+    //16カウントごと(1600Hzの場合T=10ms)にポートを読んで、LOWならON継続回数をカウントアップする。
     if (sw_timer_count > 15)
     {
         sw_timer_count = 0;
@@ -128,29 +138,59 @@ void loop()
         //周期切り替え。チャタリング防止で5(=50ms)にした。
         if (sw_count == 5)
         {
-            adcadc_cycle = heart_beat_T_sum / HEART_BEAT_AVERAGE_NO / 128 - 1;
+            draw_buf_cycle = heart_beat_T_sum / HEART_BEAT_AVERAGE_NO / 128 - 1;
             last_segment_no=0;
             //OLEDの表示時間およびその他処理遅延で最大8サイクル弱かかるので、最短は８。
             //39bpm相当：8、220bpm相当：46
-            if (adcadc_cycle < 7 && adcadc_cycle > 45)
+            if (draw_buf_cycle < 7 && draw_buf_cycle > 45)
             {
-                adcadc_cycle = 15; //心拍が測定できていないとみなして、固定値にリセットする
+                draw_buf_cycle = 15; //心拍が測定できていないとみなして、固定値にリセットする
             }
             draw_cycle = (draw_cycle + 1) % 4;
 
         }
     }
 
-    // 1600Hzサンプリングのうち、adcadc_cycleサイクルでデータ処理する
-    if (adc_cycle_count > adcadc_cycle)
+    // OLED 描画用バッファの更新周期。表示周期ではないことに注意。
+    // ADC_SAMPLING_RATE Hzサンプリングのうち、draw_buf_cycleサイクルでデータ処理する
+    if (draw_buf_cycle_count > draw_buf_cycle)
     {
-        adc_cycle_count = 0;
+        draw_buf_cycle_count = 0;
 
         // FIR処理
         fadcdata = (uint16_t)Fir_LPF(&adcbuf[0], adcbufcount);
-        
+
+#if defined(DEBUG_PRINT)
+        for (i = 0; i < draw_buf_cycle; i++)
+        {
+            if (adcbufcount_temp>0)
+            {
+                adcbufcount_temp--;
+            }
+            else
+            {
+                adcbufcount_temp=63;
+            }
+        }
+
+        for (i = 0; i < draw_buf_cycle+1; i++)
+        {
+            //if((uint16_t)adcbuf[adcbufcount_temp]==0)
+            {
+                Serial.print((uint16_t)adcbuf[adcbufcount_temp]); //シリアルモニター用出力。
+            }
+            adcbufcount_temp = (adcbufcount_temp + 1) % 64;
+
+            if (i < draw_buf_cycle)
+            {
+                Serial.println(","); //シリアルモニター用出力
+            }
+        }
+        Serial.print(","); //シリアルモニター用出力
+#endif
+
         buf3[pt0] = fadcdata;
-        ddadc=(buf3[pt0] - buf3[pt2]) - (buf3[pt2] - buf3[pt1]);
+        ddadc=(-1)*((buf3[pt0] - buf3[pt2]) - (buf3[pt2] - buf3[pt1]));
         pt0 = (pt0 + 1) % 3;
         pt1 = (pt1 + 1) % 3;
         pt2 = (pt2 + 1) % 3;
@@ -160,9 +200,9 @@ void loop()
             ddadc_max_val = (uint8_t)ddadc;
         }
 
-        //1600Hzサンプリングで3200=2秒周期で閾値を更新する。
+        //1600Hzサンプリングの場合3200=2秒周期で閾値を更新する。
         //２秒あれば完全１心拍あるはず、という計算。
-        if (max_count > 3200)
+        if (max_count > ADC_SAMPLING_RATE*2)
         {
             max_count = 0;
             ddadc_th = ddadc_max_val >>1;
@@ -170,16 +210,16 @@ void loop()
         }
         
         //心拍を２階微分した値をピーク記録し、その半分を閾値に心拍を検出する。
-        //R波付近で何度も検出してしまうので、検出後400カウント(625ms)は検出しないようにする。
+        //R波付近で何度も検出してしまうので、検出後400カウント(625ms)は検出しないようにする。(1600Hzの場合)
         //最高220bpmとすると、T=273ms=436カウントなので、最大0.91T検出しないことになる。
-        if (ddadc > (float)ddadc_th && ddadc_count>400)
+        if (ddadc > (float)ddadc_th && ddadc_count > (ADC_SAMPLING_RATE/4))
         {
             // HEART_BEAT_AVERAGE_NO周期の移動平均とする
             heart_beat_T_sum += ddadc_count;
             heart_beat_T_buf_pt = (heart_beat_T_buf_pt + 1) % HEART_BEAT_AVERAGE_NO;
             heart_beat_T_sum -= heart_beat_T_buf[heart_beat_T_buf_pt];
             heart_beat_T_buf[heart_beat_T_buf_pt] =ddadc_count;
-            heart_beat_bpm = round(1600 / (float)heart_beat_T_sum * 60 * HEART_BEAT_AVERAGE_NO); // 心拍数算出
+            heart_beat_bpm = round(ADC_SAMPLING_RATE / (float)heart_beat_T_sum * 60 * HEART_BEAT_AVERAGE_NO); // 心拍数算出
             ddadc_count = 0;
             heart_beat_draw_EN=1;
             //心拍数表示
@@ -193,12 +233,12 @@ void loop()
         // Serial.print(",");           //シリアルモニター用出力
         // Serial.print(ddadc_count);   //シリアルモニター用出力
         // Serial.print(",");           //シリアルモニター用出力
-        Serial.print(heart_beat_bpm); //シリアルモニター用出力
-        Serial.print(",");           //シリアルモニター用出力
-        //Serial.print(ddadc);         //シリアルモニター用出力
-        //Serial.print(",");   //シリアルモニター用出力
+        // Serial.print(heart_beat_bpm); //シリアルモニター用出力
+        // Serial.print(",");           //シリアルモニター用出力
+        // Serial.print(ddadc);         //シリアルモニター用出力
+        // Serial.print(",");   //シリアルモニター用出力
 
-        Serial.println(fadcdata); //シリアルモニター用出力。adcadc_cycle周期でフィルターしたデータ
+        Serial.println((uint16_t)fadcdata); //シリアルモニター用出力。draw_buf_cycle周期でフィルターしたデータ
 
         // draw_cycleはOLEDの描画列を進める周期である。
         draw_cycle_count++;
@@ -210,9 +250,9 @@ void loop()
         //OLEDの縦軸が64ピクセルなので、スケールを合わせる。
         //心臓付近で測定した場合このぐらいがちょうどいいが、
         //両手の指先で検出するなどの場合、振幅がちいさくなるので、/2しないほうがいい。
-        new_data_tmp = round(fadcdata) / 2;
+        new_data_tmp = round(fadcdata);
 
-        // OLEDの中心は64/2=32だが、下側が飽和しているので下にオフセット49しているする。
+        // OLEDの中心は64/2=32だが、下側が飽和しているので下にオフセットOLED_OFFSETしているする。
         // この値は２段目増幅の入力オフセット電圧に大きく左右されるため、
         // 使用したOPアンプにあわせて調整するのがよいだろう。
         if (new_data_tmp > (63 + (OLED_OFFSET)))
@@ -258,14 +298,83 @@ void loop()
 
 //******************************************
 //波形をFIRフィルタにかける。
-//係数は64段のカットオフ30Hzに設定にしてある
+//係数は64段のカットオフ35Hzに設定にしてある
 //******************************************
 float Fir_LPF(float *data, uint8_t count)
 {
-    float result=0;
+    float result = 0;
 
-    const float hm30Hz[64] = {
-        -0.004361021,
+#if 0
+    //テスト用フィルタ-64段average
+    const float avg64[64] = {
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625,
+        0.015625};
+    
+    //テスト用フィルタ-カットオフ30Hz
+    const float hm30Hz[64] =
+        {-0.004361021,
         -0.00352936,
         -0.002589728,
         -0.001545795,
@@ -287,7 +396,7 @@ float Fir_LPF(float *data, uint8_t count)
         0.02277279,
         0.024208362,
         0.025561886,
-        0.026822453,
+        0.026822453
         0.027979839,
         0.029024607,
         0.0299482,
@@ -330,12 +439,146 @@ float Fir_LPF(float *data, uint8_t count)
         -0.004361021,
         0};
 
-    //FIR
+    //テスト用フィルタ-カットオフ30Hz
+    const float hm40Hz[64] =
+        {-0.010212238,
+        -0.010684186,
+        -0.01091653,
+        -0.01088707,
+        -0.010577422,
+        -0.009973486,
+        -0.009065833,
+        -0.007850009,
+        -0.006326764,
+        -0.004502175,
+        -0.002387679,
+        1.96346E-18,
+        0.002639013,
+        0.005502659,
+        0.008559739,
+        0.011775013,
+        0.015109721,
+        0.018522189,
+        0.021968491,
+        0.025403162,
+        0.028779944,
+        0.032052559,
+        0.035175487,
+        0.038104743,
+        0.040798627,
+        0.043218441,
+        0.045329163,
+        0.047100053,
+        0.04850519,
+        0.049523927,
+        0.050141249,
+        0.050348041,
+        0.050141249,
+        0.049523927,
+        0.04850519,
+        0.047100053,
+        0.045329163,
+        0.043218441,
+        0.040798627,
+        0.038104743,
+        0.035175487,
+        0.032052559,
+        0.028779944,
+        0.025403162,
+        0.021968491,
+        0.018522189,
+        0.015109721,
+        0.011775013,
+        0.008559739,
+        0.005502659,
+        0.002639013,
+        1.96346E-18,
+        -0.002387679,
+        -0.004502175,
+        -0.006326764,
+        -0.007850009,
+        -0.009065833,
+        -0.009973486,
+        -0.010577422,
+        -0.01088707,
+        -0.01091653,
+        -0.010684186,
+        -0.010212238,
+        0};
+#endif
+
+    const float hm35Hz[64] =
+        {-0.008581722,
+        -0.008194836,
+        -0.007621372,
+        -0.006858064,
+        -0.005904071,
+        -0.004761053,
+        -0.003433201,
+        -0.001927242,
+        -0.0002524,
+        0.001579678,
+        0.003555026,
+        0.005657503,
+        0.00786897,
+        0.01016949,
+        0.012537567,
+        0.014950399,
+        0.017384159,
+        0.01981429,
+        0.022215815,
+        0.024563657,
+        0.026832958,
+        0.028999404,
+        0.03103954,
+        0.032931084,
+        0.034653213,
+        0.036186845,
+        0.037514892,
+        0.038622487,
+        0.039497184,
+        0.040129126,
+        0.040511173,
+        0.040639004,
+        0.040511173,
+        0.040129126,
+        0.039497184,
+        0.038622487,
+        0.037514892,
+        0.036186845,
+        0.034653213,
+        0.032931084,
+        0.03103954,
+        0.028999404,
+        0.026832958,
+        0.024563657,
+        0.022215815,
+        0.01981429,
+        0.017384159,
+        0.014950399,
+        0.012537567,
+        0.01016949,
+        0.00786897,
+        0.005657503,
+        0.003555026,
+        0.001579678,
+        -0.0002524,
+        -0.001927242,
+        -0.003433201,
+        -0.004761053,
+        -0.005904071,
+        -0.006858064,
+        -0.007621372,
+        -0.008194836,
+        -0.008581722,
+        0};
+
+    // FIR convolution
     for (uint8_t k = 0; k < 64; k++)
     {
-        result += hm30Hz[k] * data[count];
+        result += hm35Hz[k] * data[count];
         count++;
-        if(count>63)
+        if (count > 63)
         {
             count = 0;
         }
@@ -347,7 +590,7 @@ void SSD1306_Init()
 {
     // EARLEPHILHOWER_PICOのライブラリは、 Wire.setClockでclockが変えられなかったので、
     // sdkの方法でclockを変えていたが、今はWire.setClockでいいようだ。
-    // i2c_init(i2c0, 100 * 3 * 80);
+    // i2c_init(i2c0, 100 * 3 * 80); //こんな書き方をする。
 
     Wire.begin();
     // Wire.begin(SDA_OLED, SCL_OLED); //ポートを変更する場合の書き方メモ
@@ -467,6 +710,8 @@ const uint8_t font_num_7[10][5] =
         {0x64, 0x92, 0x92, 0x92, 0x6C}, // 9
 };
 
+
+
 //**************************************************
 // 心拍数をOLEDの右上に描画する
 // ECG描画で消去されないように、グローバル変数に現在の心拍数を出力しておく。
@@ -509,7 +754,7 @@ void Draw_Heart_beat(uint16_t heart_beat_bpm, uint8_t last_segment_no)
 // エイリアシングを防止の対策。
 // バッファに重ね塗りすることで描画けが最小化される。
 //
-// 実際にはADC読み出し回数に対してadcadc_cycle回に１回しか重ね塗りしていないので、
+// 実際にはADC読み出し回数に対してdraw_buf_cycle回に１回しか重ね塗りしていないので、
 // それでもぬけがあるが、気にならないレベルなのでこのままにした。
 // これ以上回数を増やすとFFTの計算時間も無視できなくなると思う。
 //**************************************************
@@ -576,7 +821,13 @@ void Draw_ECG_B(uint8_t y1, uint8_t y2, uint8_t last_segment_no)
     {
         oled_ram_buf[111+i][7] = dig_oled_buf[i];//描画位置は右上にする
     }
-    
+
+    //描画周期を表示する
+    for (int i = 0; i < 5; i++)
+    {
+        oled_ram_buf[i][7] = font_num_7[draw_cycle][i];
+    }
+
     //心拍検出タイミングを描画する。
     if(heart_beat_draw_EN==1)
     {
@@ -622,12 +873,25 @@ void Draw_ECG_B(uint8_t y1, uint8_t y2, uint8_t last_segment_no)
 
     for (page = 0; page < 8; page++)
     {
-        Column_Page_Set(last_segment_no, last_segment_no + 1, page); //セグメント128にも書いちゃってるけど、そこが問題あったら対策必要です。
-        Wire.beginTransmission(ADDRES_OLED);
-        // 2セグメントずつ送信することで高速化する。
-        Wire.write(0b01000000); // control byte, Co bit = 0 (continue), D/C# = 1 (data)
-        Wire.write(oled_ram_buf[last_segment_no][page]);
-        Wire.write(oled_ram_buf[latest_segment_no][page]);
+        if (last_segment_no == 127)
+        {
+            Column_Page_Set(last_segment_no, last_segment_no, page); //セグメント127専用
+            Wire.beginTransmission(ADDRES_OLED);
+            // 2セグメントずつ送信することで高速化する。
+            Wire.write(0b01000000); // control byte, Co bit = 0 (continue), D/C# = 1 (data)
+            Wire.write(oled_ram_buf[last_segment_no][page]);
+            //本来latest_segment_noがゼロになっているので、そこに最新データを書く必要があるが、
+            //描画が遅くなるので省略している。
+        }
+        else
+        {
+            Column_Page_Set(last_segment_no, last_segment_no + 1, page); //セグメント128には書かない
+            Wire.beginTransmission(ADDRES_OLED);
+            // 2セグメントずつ送信することで高速化する。
+            Wire.write(0b01000000); // control byte, Co bit = 0 (continue), D/C# = 1 (data)
+            Wire.write(oled_ram_buf[last_segment_no][page]);
+            Wire.write(oled_ram_buf[latest_segment_no][page]);
+        }
         Wire.endTransmission();
     }
 }
